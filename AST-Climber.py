@@ -93,6 +93,10 @@ class AstNode:
         self.parameters = None
         self.arguments = None
 
+        # Keep this as "None" unless this node falls within the conditional block
+        # of a flow-control statement
+        self.parentFlowControlNode = None
+
         self.range = self.objectFromField(RangeField, "range")
         self.instrumentationLocations = None
         self.analyzeChildren()
@@ -170,9 +174,17 @@ class AstNode:
     def findInstrumentationLocations(self, instBeginning, instEnding):
         if self.instrumentationLocations is None:
             self.instrumentationLocations = []
-            if self.range is not None:
+            if self.parentFlowControlNode is not None:
+                self.instrumentationLocations.extend(self.parentFlowControlNode.findInstrumentationLocations(instBeginning, instEnding))
+            elif self.range is not None:
                 self.instrumentationLocations.extend(self.range.findInstrumentationLocations(instBeginning, instEnding))
         return self.instrumentationLocations
+
+    def assignFlowControlNode(self, node):
+        self.parentFlowControlNode = node
+        if len(self.inner) > 0:
+            for child in self.inner:
+                child.assignFlowControlNode(node)
 
             
 class AnyInitField(AstNode):
@@ -788,7 +800,40 @@ class IfStmtNode(AstNode):
         super().__init__(root, parent)
         self.range   = self.objectFromField(RangeField, "range") 
         self.hasElse = self.getField("hasElse")
+        self.assignFlowControlNode(self)
         self.checkAttributeCoverage()
+
+    def assignFlowControlNode(self, node):
+        if len(self.inner) > 0:
+            for child in self.inner:
+                if child.kind != "CompoundStmt":
+                    child.assignFlowControlNode(node)
+
+    def findInstrumentationLocations(self, instBeginning, instEnding):
+        # Instrumenting the "ending" of an if-statement means instrumenting
+        # the beginning of the compound statements of the if- and else-blocks
+        # (or just outside of the if-block if there's no else-block)
+        #
+        # Instrumenting the "beginning" is "just before the if-statement",
+        # which is identical to how it'd be handled normally
+        if self.instrumentationLocations is None:
+            self.instrumentationLocations = []
+            if instBeginning:
+                if self.range is not None:
+                    self.instrumentationLocations.extend(self.range.findInstrumentationLocations(instBeginning, False))
+            if instEnding:
+                if self.hasElse is not None:
+                    # There's an else block, so instrument both sides
+                    for child in self.inner:
+                        if child.kind == "CompoundStmt":
+                            self.instrumentationLocations.extend(child.findInstrumentationLocations(True, False))
+                else:
+                    # No else block instrument the inside and outside of the block
+                    for child in self.inner:
+                        if child.kind == "CompoundStmt":
+                            self.instrumentationLocations.extend(child.findInstrumentationLocations(True, True))
+
+        return self.instrumentationLocations
         
 class ImplicitCastExprNode(AstNode):
     def __init__(self, root, parent):
@@ -1260,8 +1305,22 @@ def instrumentCode(allCopiesSet):
                 newInstrumentation = Instrumentation(location=location, funcName=funcName, params=params, semiColonPrefix=True, newLineAfter=False, comment="Assignment")
                 allInstrumentationLocations.append(newInstrumentation)
 
+        # Instrument all non-memcpy, non-free function calls that use the variable as an argument
+        ignoredIds = [FunctionDeclaration.memcpyId, FunctionDeclaration.freeId]
+        funcCallIds = [id for id, info in FunctionCall.allFuncCalls.items() if info[0] not in ignoredIds and copyId in info[1]]
+        pp(funcCallIds) # TODO REMOVE
+        for funcCallId in funcCallIds:
+            funcCallNode = AstNode.allNodes[funcCallId]
+            locations = funcCallNode.findInstrumentationLocations(instBeginning=False, instEnding=True)
+            funcName = "__AddAddress"
+            params = [getNameById(node.id)]
+            for location in locations:
+                newInstrumentation = Instrumentation(location=location, funcName=funcName, params=params, semiColonPrefix=True, newLineAfter=False, comment="Function Call")
+                allInstrumentationLocations.append(newInstrumentation)
+
+
         # Instrument all instances of free on the variable
-        freeCallIds = [fc for fc, info in FunctionCall.allFuncCalls.items() if info[0] == FunctionDeclaration.freeId and copyId in info[1]]
+        freeCallIds = [id for id, info in FunctionCall.allFuncCalls.items() if info[0] == FunctionDeclaration.freeId and copyId in info[1]]
         for freeCallId in freeCallIds:
             freeCallNode = AstNode.allNodes[freeCallId]
             locations = freeCallNode.findInstrumentationLocations(instBeginning=True, instEnding=False)
@@ -1270,7 +1329,6 @@ def instrumentCode(allCopiesSet):
             for location in locations:
                 newInstrumentation = Instrumentation(location=location, funcName=funcName, params=params, indentation=0, semiColonPostfix=True, newLineBefore=False, comment="Called free()")
                 allInstrumentationLocations.append(newInstrumentation)
-        
 
             
     # Sort the instrumentations in reverse order
