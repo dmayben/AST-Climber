@@ -27,13 +27,14 @@ class VariableAssignment:
     allAssignments = {}
     allAssignmentsByName = {} # For debugging
 
-    def __init__(self, id, values):
+    def __init__(self, id, values, isInitialization = False):
         self.id = id
         self.left = values[0]
         self.right = values[1:]
+        self.isInitialization = isInitialization
         if self.left is not None:
-            VariableAssignment.allAssignments[self.id] = (self.left.id, [v.id if v is not None else None for v in self.right])
-            VariableAssignment.allAssignmentsByName[self.id] = (self.left.name, [str(v.name) if v is not None else None for v in self.right])
+            VariableAssignment.allAssignments[self.id] = (self.left.id, [v.id if v is not None else None for v in self.right], isInitialization)
+            VariableAssignment.allAssignmentsByName[self.id] = (self.left.name, [str(v.name) if v is not None else None for v in self.right], isInitialization)
             
 
 class FunctionDeclaration:
@@ -74,7 +75,7 @@ class AstNode:
     def __init__(self, root, parent):
         self.root = root
         self.id = self.getField("id")
-        if self.id is not None:
+        if self.id is not None and self.id not in AstNode.allNodes:
             AstNode.allNodes[self.id] = self
         self.parent = parent
         self.file = None
@@ -91,6 +92,9 @@ class AstNode:
         self.variables = None
         self.parameters = None
         self.arguments = None
+
+        self.range = self.objectFromField(RangeField, "range")
+        self.instrumentationLocations = None
         self.analyzeChildren()
 
     def getField(self, field):
@@ -162,6 +166,14 @@ class AstNode:
                 return child.findCalledFunc()
         else:
             return (None, None)
+
+    def findInstrumentationLocations(self, instBeginning, instEnding):
+        if self.instrumentationLocations is None:
+            self.instrumentationLocations = []
+            if self.range is not None:
+                self.instrumentationLocations.extend(self.range.findInstrumentationLocations(instBeginning, instEnding))
+        return self.instrumentationLocations
+
             
 class AnyInitField(AstNode):
     def __init__(self, root, parent):
@@ -181,6 +193,13 @@ class BeginField(AstNode):
         self.expansionLoc = self.objectFromField(ExpansionLocField, "expansionLoc")
         self.line = self.getField("line")
         self.checkAttributeCoverage()
+
+    def findInstrumentationLocations(self, instBeginning, instEnding):
+        if self.instrumentationLocations is None:
+            self.instrumentationLocations = []
+            if self.offset is not None:
+                self.instrumentationLocations.extend([self.offset])
+        return self.instrumentationLocations
 
 class CopyAssignField(AstNode):
     def __init__(self, root, parent):
@@ -256,6 +275,13 @@ class EndField(AstNode):
         self.expansionLoc = self.objectFromField(ExpansionLocField, "expansionLoc")
         self.checkAttributeCoverage()
 
+    def findInstrumentationLocations(self, instBeginning, instEnding):
+        if self.instrumentationLocations is None:
+            self.instrumentationLocations = []
+            if self.offset is not None and self.tokLen is not None:
+                self.instrumentationLocations.extend([self.offset + self.tokLen])
+        return self.instrumentationLocations
+
 class ExpansionLocField(AstNode):
     def __init__(self, root, parent):
         super().__init__(root, parent)
@@ -322,6 +348,15 @@ class RangeField(AstNode):
         self.begin = self.objectFromField(BeginField, "begin")
         self.end = self.objectFromField(EndField, "end")
         self.checkAttributeCoverage()
+
+    def findInstrumentationLocations(self, instBeginning, instEnding):
+        if self.instrumentationLocations is None:
+            self.instrumentationLocations = []
+            if instBeginning and self.begin is not None:
+                self.instrumentationLocations.extend(self.begin.findInstrumentationLocations(instBeginning, instEnding))
+            if instEnding and self.end is not None:
+                self.instrumentationLocations.extend(self.end.findInstrumentationLocations(instBeginning, instEnding))
+        return self.instrumentationLocations
 
 class SpellingLocField(AstNode):
     def __init__(self, root, parent):
@@ -1006,6 +1041,8 @@ class VarDeclNode(AstNode):
         self.mangledName = self.getField("mangledName")
         self.type        = self.objectFromField(TypeField, "type")
         self.storageClass = self.getField("storageClass")
+        self.assignment  = None
+        self.hasInitialization = False
         self.findVariables()
         self.checkAttributeCoverage()
 
@@ -1014,7 +1051,8 @@ class VarDeclNode(AstNode):
         for child in self.inner:
             self.variables.extend(child.findVariables())
         if len(self.variables) > 1:
-            self.assignment = VariableAssignment(self.id, self.variables)
+            self.assignment = VariableAssignment(self.id, self.variables, isInitialization=True)
+            self.hasInitialization = True
 
 class VisibilityAttrNode(AstNode):
     def __init__(self, root, parent):
@@ -1119,6 +1157,10 @@ def getNameIdMix(id):
 def climbAST():
     r = subprocess.run(["clang", "-Xclang", "-ast-dump=json", srcFilename], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     data = json.loads(r.stdout)
+
+    with open("out.json", "w") as dbgFile:
+        json.dump(data, dbgFile, indent = 3)
+
     return nodeKindMap[data["kind"]](data, None)
 
 def buildDependencyGraph():
@@ -1126,7 +1168,7 @@ def buildDependencyGraph():
     dependencyGraphNamed= nx.DiGraph()
 
     # Add all the assignments to the graph as edges
-    for left, right in VariableAssignment.allAssignments.values():
+    for left, right, _ in VariableAssignment.allAssignments.values():
         if getFileById(left) == srcFilename:
             dependencyGraph.add_edges_from([(r, left) for r in right if r is not None and getFileById(r) == srcFilename])
             dependencyGraphNamed.add_edges_from([(getNameIdMix(r), getNameIdMix(left)) for r in right if r is not None and getFileById(r) == srcFilename])
@@ -1158,9 +1200,73 @@ def buildDependencyGraph():
     
     pos = nx.spring_layout(dependencyGraphNamed, seed=1111)
     nx.draw(dependencyGraphNamed, with_labels=True, pos=pos)
-    plt.show()
+    # plt.show()
+
+    return allCopiesSet
+
+class Instrumentation:
+    def __init__(self, location, funcName, params, semiColonPrefix=False, semiColonPostfix=False, newLineBefore=True, indentation=16, comment="", newLineAfter=True):
+        self.location = location
+        self.funcName = funcName
+        self.params = params
+        self.semiColonPrefix = semiColonPrefix
+        self.semiColonPostfix = semiColonPostfix
+        self.newLineBefore = newLineBefore
+        self.indentation = indentation
+        self.comment = comment
+        self.newLineAfter = newLineAfter
+
+    def __str__(self):
+        str = ""
+        if self.semiColonPrefix:
+            str += ";"
+        if self.newLineBefore:
+            str += "\n"
+        str += ' '*self.indentation
+        str += self.funcName
+        str += "("
+        str += ','.join(self.params)
+        str += ")"
+        if self.semiColonPostfix:
+            str += ";"
+        if len(self.comment) > 0:
+            str += " /* " + self.comment + " */ "
+        if self.newLineAfter:
+            str += "\n"
+        return str
+
+def instrumentCode(allCopiesSet):
+
+    allInstrumentationLocations = []
+    for copyId in allCopiesSet:
+        # If this variable isn't a function parameter, instrument its initialization with __AddAddress()
+        node = AstNode.allNodes[copyId]
+        if node.kind == "VarDecl" and node.hasInitialization is True:
+            locations = node.findInstrumentationLocations(instBeginning=False, instEnding=True)
+            funcName = "__AddAddress"
+            params = [getNameById(node.id)]
+            for location in locations:
+                newInstrumentation = Instrumentation(location=location, funcName=funcName, params=params, semiColonPrefix=True, newLineAfter=False, comment="Initialization")
+                allInstrumentationLocations.append(newInstrumentation)
+            
+    # Sort the instrumentations in reverse order
+    allInstrumentationLocations.sort(reverse=True, key=lambda i: i.location)
+
+    # Read in the data from the source file
+    sourceFile = open(srcFilename, "r")
+    data = sourceFile.read()
+    sourceFile.close()
+
+    # Perform all the instrumentations
+    for instrumentation in allInstrumentationLocations:
+        data = data[:instrumentation.location] + str(instrumentation) + data[instrumentation.location:]
+
+    instFilename = "example_inst.cc"
+    with open(instFilename, "w") as instrumentedFile:
+        instrumentedFile.write(data)
 
 if __name__ == "__main__":
     nodeMap = climbAST()
-    buildDependencyGraph()
+    allCopiesSet = buildDependencyGraph()
+    instrumentCode(allCopiesSet)
     

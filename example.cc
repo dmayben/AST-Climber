@@ -26,7 +26,6 @@ void CWE244_dummy()
 {
     char* X = (char*)malloc(100*sizeof(char));
     char* X_shallowcp = X;
-    X_shallowcp = X;
     char* X_shallowcp2;
     char* X_shallowcp3 = X_shallowcp2 = X;
     if(fgets(X, 100, stdin) == NULL) {
