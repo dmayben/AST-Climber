@@ -71,6 +71,7 @@ class FunctionCall:
 class AstNode:
     allNodes = {}
     currentFile = None
+    firstSrcFileNode = None
 
     def __init__(self, root, parent):
         self.root = root
@@ -86,6 +87,8 @@ class AstNode:
             self.file = AstNode.currentFile
         else:
             AstNode.currentFile = self.file
+            if self.file == srcFilename and AstNode.firstSrcFileNode is None:
+                AstNode.firstSrcFileNode = self
 
         self.kind = self.getField("kind")
         self.inner = []
@@ -524,6 +527,18 @@ class CompoundStmtNode(AstNode):
         super().__init__(root, parent)
         self.range = self.objectFromField(RangeField, "range")
         self.checkAttributeCoverage()
+    def findInstrumentationLocations(self, instBeginning, instEnding):
+        # We have to instrument the "beginning" of a CompoundStmt by
+        # using the space just before the block's first statement.
+        # Otherwise the beginning is directly behind the left curly-brace
+        if self.instrumentationLocations is None:
+            self.instrumentationLocations = []
+            if instBeginning:
+                if len(self.inner) > 0:
+                    self.instrumentationLocations.extend(self.inner[0].findInstrumentationLocations(True, False))
+            if instEnding:
+                self.instrumentationLocations.extend(self.range.findInstrumentationLocations(False, True))
+        return self.instrumentationLocations
 
 class ConditionalOperatorNode(AstNode):
     def __init__(self, root, parent):
@@ -821,7 +836,7 @@ class IfStmtNode(AstNode):
             self.instrumentationLocations = []
             if instBeginning:
                 if self.range is not None:
-                    self.instrumentationLocations.extend(self.range.findInstrumentationLocations(instBeginning, False))
+                    self.instrumentationLocations.extend(self.range.findInstrumentationLocations(True, False))
             if instEnding:
                 if self.hasElse is not None:
                     # There's an else block, so instrument both sides
@@ -1250,7 +1265,7 @@ def buildDependencyGraph():
 
     return allCopiesSet
 
-class Instrumentation:
+class FuncInstrumentation:
     def __init__(self, location, funcName, params, semiColonPrefix=False, semiColonPostfix=False, newLineBefore=True, indentation=16, comment="", newLineAfter=True):
         self.location = location
         self.funcName = funcName
@@ -1281,6 +1296,13 @@ class Instrumentation:
             str += "\n"
         return str
 
+class InstrumentationDirect:
+    def __init__(self, location, str):
+        self.location = location
+        self.str = str
+    def __str__(self):
+        return self.str
+
 def instrumentCode(allCopiesSet):
 
     allInstrumentationLocations = []
@@ -1292,7 +1314,7 @@ def instrumentCode(allCopiesSet):
             funcName = "__AddAddress"
             params = [getNameById(node.id)]
             for location in locations:
-                newInstrumentation = Instrumentation(location=location, funcName=funcName, params=params, semiColonPrefix=True, newLineAfter=False, comment="Initialization")
+                newInstrumentation = FuncInstrumentation(location=location, funcName=funcName, params=params, semiColonPrefix=True, newLineAfter=False, comment="Initialization")
                 allInstrumentationLocations.append(newInstrumentation)
 
         # Instrument all assignments of variables that are not initializations
@@ -1303,7 +1325,7 @@ def instrumentCode(allCopiesSet):
             funcName = "__AddAddress"
             params = [getNameById(node.id)]
             for location in locations:
-                newInstrumentation = Instrumentation(location=location, funcName=funcName, params=params, semiColonPrefix=True, newLineAfter=False, comment="Assignment")
+                newInstrumentation = FuncInstrumentation(location=location, funcName=funcName, params=params, semiColonPrefix=True, newLineAfter=False, comment="Assignment")
                 allInstrumentationLocations.append(newInstrumentation)
 
         # Instrument all non-memcpy, non-free function calls that use the variable as an argument
@@ -1314,10 +1336,16 @@ def instrumentCode(allCopiesSet):
             locations = funcCallNode.findInstrumentationLocations(instBeginning=False, instEnding=True)
             funcName = "__AddAddress"
             params = [getNameById(node.id)]
+            semiColonPrefix = True
+            semiColonPostfix = False
+            # If this is going to be put in/around a compoundstmt block
+            # reverse the semicolon position
+            if funcCallNode.parentFlowControlNode is not None:
+                semiColonPrefix = False
+                semiColonPostfix = True
             for location in locations:
-                newInstrumentation = Instrumentation(location=location, funcName=funcName, params=params, semiColonPrefix=True, newLineAfter=False, comment="Function Call")
+                newInstrumentation = FuncInstrumentation(location=location, funcName=funcName, params=params, semiColonPrefix=semiColonPrefix, semiColonPostfix=semiColonPostfix, newLineAfter=False, comment="Function Call")
                 allInstrumentationLocations.append(newInstrumentation)
-
 
         # Instrument all instances of free on the variable
         freeCallIds = [id for id, info in FunctionCall.allFuncCalls.items() if info[0] == FunctionDeclaration.freeId and copyId in info[1]]
@@ -1327,8 +1355,29 @@ def instrumentCode(allCopiesSet):
             funcName = "__MemoryWipingCheck"
             params = [getNameById(node.id)]
             for location in locations:
-                newInstrumentation = Instrumentation(location=location, funcName=funcName, params=params, indentation=0, semiColonPostfix=True, newLineBefore=False, comment="Called free()")
+                newInstrumentation = FuncInstrumentation(location=location, funcName=funcName, params=params, indentation=0, semiColonPostfix=True, newLineBefore=False, comment="Called free()")
                 allInstrumentationLocations.append(newInstrumentation)
+
+    # Finally, add the definitions of the implementation functions
+    addAddressImpl = """
+
+    void __AddAddress(void* addr) {
+        /* Function body goes here */
+    }
+
+    """
+
+    memoryWipingCheckImpl = """
+    
+    void __MemoryWipingCheck(void* addr) {
+        /* Function body goes here */
+    }
+
+    """
+
+    location = AstNode.firstSrcFileNode.findInstrumentationLocations(True, False)
+    allInstrumentationLocations.append(InstrumentationDirect(location[0], addAddressImpl))
+    allInstrumentationLocations.append(InstrumentationDirect(location[0], memoryWipingCheckImpl))
             
     # Sort the instrumentations in reverse order
     allInstrumentationLocations.sort(reverse=True, key=lambda i: i.location)
@@ -1350,4 +1399,3 @@ if __name__ == "__main__":
     nodeMap = climbAST()
     allCopiesSet = buildDependencyGraph()
     instrumentCode(allCopiesSet)
-    
