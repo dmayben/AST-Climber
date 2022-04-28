@@ -1248,6 +1248,17 @@ def instrumentCode(allCopiesSet):
             for location in locations:
                 newInstrumentation = Instrumentation(location=location, funcName=funcName, params=params, semiColonPrefix=True, newLineAfter=False, comment="Initialization")
                 allInstrumentationLocations.append(newInstrumentation)
+
+        # Instrument all assignments of variables that are not initializations
+        shallowCopyIds = [k for k,v in VariableAssignment.allAssignments.items() if v[0] == copyId and not v[2]]
+        for shallowCopyId in shallowCopyIds:
+            shallowCopyNode = AstNode.allNodes[shallowCopyId]
+            locations = shallowCopyNode.findInstrumentationLocations(instBeginning=False, instEnding=True)
+            funcName = "__AddAddress"
+            params = [getNameById(node.id)]
+            for location in locations:
+                newInstrumentation = Instrumentation(location=location, funcName=funcName, params=params, semiColonPrefix=True, newLineAfter=False, comment="Assignment")
+                allInstrumentationLocations.append(newInstrumentation)
             
     # Sort the instrumentations in reverse order
     allInstrumentationLocations.sort(reverse=True, key=lambda i: i.location)
