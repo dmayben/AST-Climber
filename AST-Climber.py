@@ -1259,6 +1259,19 @@ def instrumentCode(allCopiesSet):
             for location in locations:
                 newInstrumentation = Instrumentation(location=location, funcName=funcName, params=params, semiColonPrefix=True, newLineAfter=False, comment="Assignment")
                 allInstrumentationLocations.append(newInstrumentation)
+
+        # Instrument all instances of free on the variable
+        freeCallIds = [fc for fc, info in FunctionCall.allFuncCalls.items() if info[0] == FunctionDeclaration.freeId and copyId in info[1]]
+        for freeCallId in freeCallIds:
+            freeCallNode = AstNode.allNodes[freeCallId]
+            locations = freeCallNode.findInstrumentationLocations(instBeginning=True, instEnding=False)
+            funcName = "__MemoryWipingCheck"
+            params = [getNameById(node.id)]
+            for location in locations:
+                newInstrumentation = Instrumentation(location=location, funcName=funcName, params=params, indentation=0, semiColonPostfix=True, newLineBefore=False, comment="Called free()")
+                allInstrumentationLocations.append(newInstrumentation)
+        
+
             
     # Sort the instrumentations in reverse order
     allInstrumentationLocations.sort(reverse=True, key=lambda i: i.location)
