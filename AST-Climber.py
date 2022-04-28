@@ -186,6 +186,7 @@ class AstNode:
             for child in self.inner:
                 child.assignFlowControlNode(node)
 
+
             
 class AnyInitField(AstNode):
     def __init__(self, root, parent):
@@ -1308,7 +1309,6 @@ def instrumentCode(allCopiesSet):
         # Instrument all non-memcpy, non-free function calls that use the variable as an argument
         ignoredIds = [FunctionDeclaration.memcpyId, FunctionDeclaration.freeId]
         funcCallIds = [id for id, info in FunctionCall.allFuncCalls.items() if info[0] not in ignoredIds and copyId in info[1]]
-        pp(funcCallIds) # TODO REMOVE
         for funcCallId in funcCallIds:
             funcCallNode = AstNode.allNodes[funcCallId]
             locations = funcCallNode.findInstrumentationLocations(instBeginning=False, instEnding=True)
@@ -1329,7 +1329,6 @@ def instrumentCode(allCopiesSet):
             for location in locations:
                 newInstrumentation = Instrumentation(location=location, funcName=funcName, params=params, indentation=0, semiColonPostfix=True, newLineBefore=False, comment="Called free()")
                 allInstrumentationLocations.append(newInstrumentation)
-
             
     # Sort the instrumentations in reverse order
     allInstrumentationLocations.sort(reverse=True, key=lambda i: i.location)
